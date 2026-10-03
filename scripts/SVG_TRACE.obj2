@@ -1,0 +1,194 @@
+--label:HexScript
+--information:SVG_TRACE@ビットマップベクター化 v0.1.3 by HexBrowns
+--object
+
+--group:入力の設定
+--select@source:入力=0,ファイル=0,レイヤー=1
+--file@image_path:画像ファイル
+--select@layer_base:レイヤー位置=1,絶対指定=0,相対指定=1
+--track@layer_index:レイヤー,-100,100,1,1
+
+--group:トレース
+--select@mode:モード=0,二値=0,カラー=1
+--track@colors:色数,2,16,8,1
+--track@binary_threshold:二値閾値,0,255,128,1
+--track@filter_speckle:スペックル除去,0,64,4,1
+--track@corner_threshold:角閾値,0,180,60,1
+
+--group:書き出し
+--file@export_path:出力SVG
+--check@auto_export:自動書き出し,0
+--group:
+
+local function is_on(v)
+  return v == 1 or v == true
+end
+
+local function resolve_layer()
+  local idx = math.floor(tonumber(layer_index) or 1)
+  if layer_base == 1 then
+    idx = (obj.layer or 1) + idx
+  end
+  return idx
+end
+
+local function load_module()
+  local ok, m = pcall(obj.module, "svg_trace@svg_trace")
+  if ok and m then return m end
+  ok, m = pcall(obj.module, "svg_trace")
+  if ok and m then return m end
+  return nil
+end
+
+local function image_stem(path)
+  local name = tostring(path or ""):gsub("[/\\]+$", "")
+  name = name:match("([^/\\]+)$") or name
+  name = name:gsub("%.[^%.]+$", "")
+  name = name:gsub('[<>:"/\\|%?%*]', "_")
+  name = name:match("^%s*(.-)%s*$") or name
+  if name == "" or name:match("^%.+$") then
+    return "image"
+  end
+  return name
+end
+
+local function cfg_table(export_extra)
+  local t = {
+    mode = tonumber(mode) or 0,
+    colors = math.floor(tonumber(colors) or 8),
+    filter_speckle = math.floor(tonumber(filter_speckle) or 4),
+    corner_threshold = math.floor(tonumber(corner_threshold) or 60),
+    binary_threshold = math.floor(tonumber(binary_threshold) or 128),
+  }
+  if export_extra then
+    for k, v in pairs(export_extra) do
+      t[k] = v
+    end
+  end
+  return t
+end
+
+local function try_call(fn, ...)
+  local ok, a, b, c, d = pcall(fn, ...)
+  if not ok then
+    return nil
+  end
+  return a, b, c, d
+end
+
+local function cache_key(src_tag, w, h)
+  return table.concat({
+    tostring(src_tag or ""),
+    tostring(w or 0),
+    tostring(h or 0),
+    tostring(mode or 0),
+    tostring(colors or 0),
+    tostring(binary_threshold or 0),
+    tostring(filter_speckle or 0),
+    tostring(corner_threshold or 0),
+    tostring(image_path or ""),
+    tostring(layer_base or 0),
+    tostring(layer_index or 0),
+    -- 自動書き出しを ON にしたとき・出力先を変えたときにトレースし直して書き出す
+    tostring(is_on(auto_export) and 1 or 0),
+    tostring(export_path or ""),
+  }, "|")
+end
+
+-- キャッシュは mod2 がインスタンス（obj.id）ごとに持つ（v0.1.3）。
+-- v0.1.2 までは Lua 側でキーだけを持ち、当たったときに mod2 の「直前の結果」を描いていたので、
+-- SVG_TRACE を 2 つ置くと互いの結果が入れ替わりえた
+local oid = tostring(obj.id or obj.layer or 0)
+local mod_render_cached
+
+local function draw_cached(k)
+  local ptr, rw, rh = try_call(mod_render_cached, oid, k)
+  if ptr and rw and rh and rw > 0 and rh > 0 then
+    obj.putpixeldata("object", ptr, rw, rh, "rgba")
+    return true
+  end
+  return false
+end
+
+local function trace_cfg(k, export_extra)
+  local extra = {
+    instance = oid,
+    cache_key = k,
+    auto_export = is_on(auto_export) and 1 or 0,
+  }
+  for kk, v in pairs(export_extra) do
+    extra[kk] = v
+  end
+  return cfg_table(extra)
+end
+
+local mod = load_module()
+if not mod then
+  obj.load("text", "")
+  return
+end
+mod_render_cached = mod.render_cached
+
+local svg, out_w, out_h
+local key
+
+if source == 1 then
+  -- レイヤー入力
+  local layer_no = resolve_layer()
+  if layer_no <= 0 or layer_no == obj.layer then
+    obj.load("text", "")
+    return
+  end
+  if not obj.load("layer", layer_no, false) then
+    obj.load("text", "")
+    return
+  end
+  local data, w, h = obj.getpixeldata("object", "rgba")
+  if not data or not w or not h or w < 1 or h < 1 then
+    obj.load("text", "")
+    return
+  end
+  local frame_no = math.floor(tonumber(obj.frame) or 0)
+  key = cache_key("layer:" .. tostring(layer_no) .. ":f" .. tostring(frame_no), w, h)
+  if draw_cached(key) then
+    return
+  end
+  svg, out_w, out_h = try_call(mod.vectorize_rgba, data, w, h, trace_cfg(key, {
+    export_kind = "layer",
+    export_layer = layer_no,
+    export_frame = frame_no,
+  }))
+else
+  -- ファイル入力
+  local path = tostring(image_path or "")
+  if path == "" then
+    obj.load("text", "")
+    return
+  end
+  key = cache_key("file", 0, 0)
+  if draw_cached(key) then
+    return
+  end
+  svg, out_w, out_h = try_call(mod.vectorize_file, path, trace_cfg(key, {
+    export_kind = "file",
+    export_stem = image_stem(path),
+  }))
+end
+
+if not svg or svg == "" then
+  obj.load("text", "")
+  return
+end
+
+-- 自動書き出し ON のときの連番・latest.svg は mod2 が書く。ここでは「出力SVG」の指定先だけ
+if is_on(auto_export) then
+  local ep = tostring(export_path or "")
+  if ep ~= "" then
+    try_call(mod.write_latest, ep, oid)
+  end
+end
+
+-- 結果は mod2 のこのインスタンスのスロットにある。巨大文字列の受け渡しを避ける
+if not draw_cached(key) then
+  obj.load("text", "")
+end

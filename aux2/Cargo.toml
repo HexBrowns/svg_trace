@@ -1,0 +1,16 @@
+[package]
+name = "svg-trace-aux2"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "svg_trace.aux2 - Generic plugin: send traced SVG to SVG_H"
+
+[lib]
+name = "svg_trace_aux"
+crate-type = ["cdylib"]
+
+[dependencies]
+aviutl2 = "0.47"
+anyhow = "1"
