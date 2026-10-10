@@ -1,0 +1,36 @@
+#:schema ./.aviutl2-cli/aviutl2.schema.json
+#
+# ビルドと配布の設定（aviutl2-cli: https://github.com/sevenc-nanashi/aviutl2-cli）。
+#   au2 release   ビルドして release/ に au2pkg とカタログ用の catalog.json を作る
+# project.version は Cargo.toml の [workspace.package] version と揃える。
+# mod2 と aux2 は、以前の build.ps1 と同じく -p で 1 本ずつビルドする。
+
+[project]
+id = "HexBrowns.svg_trace"
+name = "SVG_TRACE"
+version = "0.1.4"
+
+[artifacts."svg_trace.mod2"]
+build = "cargo build --release -p svg-trace-mod2"
+source = "target/release/svg_trace.dll"
+destination = "Script/svg_trace/svg_trace.mod2"
+
+[artifacts."SVG_TRACE.obj2"]
+source = "scripts/SVG_TRACE.obj2"
+destination = "Script/svg_trace/SVG_TRACE.obj2"
+
+[artifacts."svg_trace.aux2"]
+build = "cargo build --release -p svg-trace-aux2"
+source = "target/release/svg_trace_aux.dll"
+destination = "Plugin/svg_trace/svg_trace.aux2"
+
+[release]
+# インストール時のダイアログに、本体と依存クレートのライセンスを出す
+prebuild = ['copy /b /y LICENSE + THIRD_PARTY_CRATES.md release\package.txt >nul']
+package_template = "release/package.txt"
+package_information = "{name} v{version} by HexBrowns"
+
+[catalog]
+id = "HexBrowns.svg_trace"
+license_path = { type = "MIT", path = "./LICENSE" }
+download_repo = { owner = "HexBrowns", repo = "svg_trace" }

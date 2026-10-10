@@ -192,6 +192,14 @@ pub fn handoff_svg_path() -> PathBuf {
         .join("latest_trace.svg")
 }
 
+/// インスタンスごとの受け渡しファイルの置き場（`{obj.id}.svg`。aux2 の `instance_svg_dir` と同じ場所）
+pub fn instance_svg_dir() -> PathBuf {
+    aviutl2::config::app_data_path()
+        .join("Plugin")
+        .join("svg_trace")
+        .join("traces")
+}
+
 /// Windows 禁則文字などを `_` に置換した安全な stem
 pub fn sanitize_stem(raw: &str) -> String {
     let s: String = raw

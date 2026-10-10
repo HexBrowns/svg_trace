@@ -3,8 +3,15 @@ use aviutl2::{
     tracing,
 };
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::SystemTime;
 
 static EDIT_HANDLE: aviutl2::generic::GlobalEditHandle = aviutl2::generic::GlobalEditHandle::new();
+
+/// このプラグインを読み込んだ時刻。インスタンスごとの受け渡しファイルは、これより後に
+/// 書かれたものだけを使う（オブジェクト ID はアプリ起動ごとに振り直されるので、前の起動で
+/// 書かれたファイルは別のオブジェクトのものでありうる）
+static SESSION_START: OnceLock<SystemTime> = OnceLock::new();
 
 #[aviutl2::plugin(GenericPlugin)]
 struct SvgTraceAux2;
@@ -20,6 +27,7 @@ impl aviutl2::generic::GenericPlugin for SvgTraceAux2 {
             .event_format(aviutl2::logger::AviUtl2Formatter)
             .with_writer(aviutl2::logger::AviUtl2LogWriter)
             .init();
+        let _ = SESSION_START.set(SystemTime::now());
         let _ = write_export_root_sidecar(&fallback_export_dir());
         Ok(Self)
     }
@@ -78,6 +86,30 @@ fn handoff_svg_path() -> PathBuf {
         .join("Plugin")
         .join("svg_trace")
         .join("latest_trace.svg")
+}
+
+/// mod2 がインスタンス（オブジェクト ID）ごとに書く受け渡しファイルの置き場
+/// （mod2 の `instance_svg_dir` と同じ場所。v0.1.3 までの mod2 は書かない）
+fn instance_svg_dir() -> PathBuf {
+    aviutl2::config::app_data_path()
+        .join("Plugin")
+        .join("svg_trace")
+        .join("traces")
+}
+
+/// オブジェクト ID の受け渡しファイル。この起動の間に書かれたものだけを返す
+fn instance_svg_source(object_id: i64, session_start: SystemTime) -> Option<PathBuf> {
+    instance_svg_source_in(&instance_svg_dir(), object_id, session_start)
+}
+
+fn instance_svg_source_in(dir: &Path, object_id: i64, session_start: SystemTime) -> Option<PathBuf> {
+    if object_id == 0 {
+        // SDK の get_object_id は取得できないとき 0 を返す
+        return None;
+    }
+    let path = dir.join(format!("{object_id}.svg"));
+    let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+    (modified >= session_start).then_some(path)
 }
 
 /// 直前にトレースした SVG の置き場。受け渡しファイルを優先し、無ければ書き出し先の `latest.svg`
@@ -151,10 +183,81 @@ fn confirm_latest_export() -> aviutl2::AnyResult<()> {
     Ok(())
 }
 
+/// 「SVG_Hへ送る」の対象。右クリックしたオブジェクトを取る。
+///
+/// オブジェクトメニューのコールバックには対象のオブジェクトが渡されないので、
+/// 1. マウスの位置（右クリックした所）にあるオブジェクトが選択の中にあれば、それ
+/// 2. 無ければ、オブジェクト設定ウィンドウのフォーカス
+/// 3. それも無く、選択が 1 つだけなら、それ
+fn menu_target_object(
+    edit: &aviutl2::generic::EditSection,
+) -> Option<aviutl2::generic::ObjectHandle> {
+    let selected = edit.get_selected_objects().unwrap_or_default();
+    if let Ok(Some(pos)) = edit.get_mouse_layer_frame() {
+        if let Ok(Some(h)) = edit.find_object_after(pos.layer, pos.frame) {
+            let under_mouse = edit
+                .get_object_layer_frame(h)
+                .map(|lf| lf.layer == pos.layer && lf.start <= pos.frame && pos.frame <= lf.end)
+                .unwrap_or(false);
+            if under_mouse && selected.contains(&h) {
+                return Some(h);
+            }
+        }
+    }
+    if let Ok(Some(h)) = edit.get_focused_object() {
+        if edit.object_exists(h) {
+            return Some(h);
+        }
+    }
+    match selected.as_slice() {
+        [h] if edit.object_exists(*h) => Some(*h),
+        _ => None,
+    }
+}
+
+/// ログに出すオブジェクトの説明（レイヤーと開始フレーム、ID）
+fn describe_object(
+    edit: &aviutl2::generic::EditSection,
+    object: aviutl2::generic::ObjectHandle,
+    object_id: i64,
+) -> String {
+    match edit.get_object_layer_frame(object) {
+        Ok(lf) => format!(
+            "レイヤー{} の開始フレーム {}（0 始まり）のオブジェクト（ID {object_id}）",
+            lf.layer + 1,
+            lf.start
+        ),
+        Err(_) => format!("オブジェクト（ID {object_id}）"),
+    }
+}
+
 fn send_latest_to_svg_h() -> aviutl2::AnyResult<()> {
     EDIT_HANDLE.call_edit_section(|edit| -> aviutl2::AnyResult<()> {
         let export_dir = resolve_export_dir_in_edit(edit);
-        let src = latest_svg_source(&export_dir);
+
+        // 右クリックしたオブジェクトのトレース結果（mod2 が obj.id ごとに書く）を探す。
+        // 無ければ、v0.1.3 までと同じく全体で最後にトレースした結果を送り、そのことをログに出す
+        let target = menu_target_object(edit).map(|h| (h, edit.get_object_id(h).unwrap_or(0)));
+        let session_start = SESSION_START.get().copied().unwrap_or(SystemTime::UNIX_EPOCH);
+        let picked = target.and_then(|(h, id)| {
+            instance_svg_source(id, session_start).map(|p| (p, describe_object(edit, h, id)))
+        });
+        let (src, sent_what) = match picked {
+            Some((p, what)) => (p, format!("{what} のトレース結果")),
+            None => {
+                let reason = match target {
+                    Some((h, id)) => format!(
+                        "{} のトレース結果が見つからない（SVG_TRACE でないか、この起動でまだ描かれていない）",
+                        describe_object(edit, h, id)
+                    ),
+                    None => "対象のオブジェクトが分からない".to_string(),
+                };
+                (
+                    latest_svg_source(&export_dir),
+                    format!("全体で最後にトレースした結果（{reason}ため）"),
+                )
+            }
+        };
         if !src.is_file() {
             anyhow::bail!("最新SVGがありません。先に SVG_TRACE でトレースしてください");
         }
@@ -202,7 +305,11 @@ fn send_latest_to_svg_h() -> aviutl2::AnyResult<()> {
             position.frame,
             0,
         )?;
-        tracing::info!("Created SVG_H from {}", svg_path.display());
+        tracing::info!(
+            "SVG_Hへ送る: {sent_what} を送った（{} → {}）",
+            src.display(),
+            svg_path.display()
+        );
         Ok(())
     })??;
     Ok(())
@@ -225,6 +332,49 @@ fn capture_attr(svg: &str, name: &str) -> Option<u32> {
         .take_while(|c| c.is_ascii_digit() || *c == '.')
         .collect();
     num.parse::<f32>().ok().map(|v| v.ceil() as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("aux2_test")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// この起動の間に書かれた、その ID のファイルだけを使う
+    #[test]
+    fn instance_source_requires_this_session() {
+        let dir = temp_dir("instance");
+        let path = dir.join("42.svg");
+        std::fs::write(&path, "<svg/>").unwrap();
+        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let before = written - Duration::from_secs(10);
+        assert_eq!(instance_svg_source_in(&dir, 42, before), Some(path.clone()));
+        // 前の起動で書かれたファイル（起動より古い）は使わない
+        let after = written + Duration::from_secs(10);
+        assert_eq!(instance_svg_source_in(&dir, 42, after), None);
+        // 別の ID・取得できなかった ID（0）は使わない
+        assert_eq!(instance_svg_source_in(&dir, 43, before), None);
+        assert_eq!(instance_svg_source_in(&dir, 0, before), None);
+    }
+
+    #[test]
+    fn parse_svg_size_reads_width_height() {
+        assert_eq!(
+            parse_svg_size(r#"<svg width="120.5" height="80" xmlns="x">"#),
+            Some((121, 80))
+        );
+        assert_eq!(parse_svg_size("<svg>"), None);
+    }
 }
 
 aviutl2::register_generic_plugin!(SvgTraceAux2);

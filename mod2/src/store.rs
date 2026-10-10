@@ -13,6 +13,23 @@
 //!   書き出し先には置かない
 //! - 名前付き SVG（`{画像名}_NNN.svg` / `layer{n}_{f}.svg`）と書き出し先の `latest.svg` は
 //!   「自動書き出し」が ON のときだけ書く
+//! - インスタンスごとの受け渡しファイル（`Plugin/svg_trace/traces/{obj.id}.svg`）も
+//!   トレースのたびに書く（内容が同じなら書かない）。aux2 の「SVG_Hへ送る」が、右クリックした
+//!   オブジェクトの ID（SDK の `get_object_id`）でこれを引く。ID はアプリ起動ごとに振り直されるので、
+//!   aux2 は起動より前に書かれたファイルを使わない
+//!
+//! ## Lua へ返すポインタの寿命
+//!
+//! `render_cached` と `rasterize_svg` は画素のポインタを Lua へ返し、Lua はそれを
+//! `obj.putpixeldata` に渡す。返した時点でモジュールの Mutex は外れているので、スクリプトが
+//! 並列に走ると、別のオブジェクトの `store_result` がスロットを捨てて、Lua が
+//! `obj.putpixeldata` を呼ぶ前に画素を解放しうる（v0.1.3 まで）。
+//!
+//! 今は画素を `Arc` で持ち、Lua へ返した画素はスレッドごとの「貸し出し」にも 1 つ持たせる。
+//! スロットを捨てても、貸し出しが参照している間は解放されない。貸し出しは、同じスレッドが次に
+//! ポインタを受け取るときに入れ替わる。1 つのスレッドの Lua は逐次に動くので、その時点で前の
+//! `obj.putpixeldata` は終わっている。しばらく呼ばれないスレッドの貸し出しは `LEND_GRACE` の後に
+//! 片付ける（ポインタを受け取ってから `obj.putpixeldata` までは同じ Lua の実行の中で、一瞬で済む）
 
 use crate::trace::{rasterize_svg, write_export_svg_in, TraceConfig, TraceResult};
 use anyhow::{Context, Result};
@@ -20,10 +37,17 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
 /// 削除されたオブジェクトのスロットがいつまでも残らないように、古いものから捨てる
 pub const MAX_SLOTS: usize = 32;
+
+/// 貸し出しを片付けるまでの猶予。これより長く呼ばれていないスレッドの分だけ捨てる
+pub const LEND_GRACE: Duration = Duration::from_secs(30);
+
+/// 描いた画素（ストレートの RGBA）。Lua へ返す間は貸し出しが参照を持つ
+pub type Raster = Arc<Vec<u8>>;
 
 /// ファイル入力の元画像の状態。上書きされたら当てない
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,7 +80,7 @@ struct Slot {
     height: u32,
     source: Option<SourceStamp>,
     /// 描いた画素（ストレートの RGBA）。描くまでは None
-    raster: Option<(Vec<u8>, u32, u32)>,
+    raster: Option<(Raster, u32, u32)>,
     used: u64,
 }
 
@@ -67,6 +91,8 @@ pub struct ExportTargets {
     pub export_dir: PathBuf,
     /// 「SVG_Hへ送る」用の受け渡しファイル
     pub handoff_path: PathBuf,
+    /// インスタンスごとの受け渡しファイルの置き場（`{obj.id}.svg`）
+    pub instance_dir: PathBuf,
 }
 
 /// `store_result` が何を書いたか
@@ -74,6 +100,8 @@ pub struct ExportTargets {
 pub struct StoreOutcome {
     pub handoff_written: bool,
     pub exported: Option<PathBuf>,
+    /// インスタンスごとの受け渡しファイルを書いたなら、そのパス
+    pub instance_written: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -84,12 +112,39 @@ pub struct TraceStore {
     last: Option<TraceResult>,
     /// 直前に受け渡しファイルへ書いた内容のハッシュ
     handoff_hash: Option<u64>,
+    /// インスタンスごとの受け渡しファイルへ直前に書いた内容のハッシュ
+    instance_hashes: HashMap<String, u64>,
+    /// Lua へ返した画素。キーはスレッド ID（`GetCurrentThreadId`）
+    lent: HashMap<u32, (Raster, Instant)>,
 }
 
 fn hash_str(s: &str) -> u64 {
     let mut h = DefaultHasher::new();
     s.hash(&mut h);
     h.finish()
+}
+
+/// インスタンス名（Lua の `tostring(obj.id)`）を受け渡しファイルの名前にする。
+///
+/// aux2 は SDK の `get_object_id`（i64）を 10 進で書いた名前で引くので、数値なら整数の
+/// 10 進に揃える（LuaJIT の `tostring` は大きな数を `1e+15` の形で書くため）。
+/// 数値でなければ英数字と `_` `-` だけのときに限ってそのまま使い、それ以外は書かない
+pub fn instance_file_stem(instance: &str) -> Option<String> {
+    let s = instance.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(v) = s.parse::<f64>() {
+        const EXACT: f64 = 9_007_199_254_740_992.0; // 2^53
+        if v.is_finite() && v.fract() == 0.0 && v.abs() <= EXACT {
+            return Some(format!("{}", v as i64));
+        }
+        return None;
+    }
+    let safe = s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    safe.then(|| s.to_string())
 }
 
 impl TraceStore {
@@ -133,6 +188,24 @@ impl TraceStore {
             self.handoff_hash = Some(h);
             outcome.handoff_written = true;
         }
+        if let Some(stem) = instance_file_stem(&cfg.instance) {
+            if self.instance_hashes.get(&stem) != Some(&h) {
+                let path = targets.instance_dir.join(format!("{stem}.svg"));
+                match write_file(&path, &result.svg) {
+                    Ok(()) => {
+                        self.instance_hashes.insert(stem, h);
+                        outcome.instance_written = Some(path);
+                    }
+                    Err(_) => {
+                        // 「SVG_Hへ送る」のためだけのファイルなので、描画は止めない。
+                        // 前のトレース結果を残すと aux2 が古い内容を送るので、消して「無い」にする
+                        // （aux2 は直前のトレース結果へ戻り、そのことをログに出す）
+                        let _ = std::fs::remove_file(&path);
+                        self.instance_hashes.remove(&stem);
+                    }
+                }
+            }
+        }
         if cfg.auto_export {
             let path = write_export_svg_in(&targets.export_dir, &result.svg, &cfg.export_meta())?;
             outcome.exported = Some(path);
@@ -159,8 +232,9 @@ impl TraceStore {
 
     /// インスタンスのスロットが `key` の結果を持っていれば、描いた画素を返す。
     ///
-    /// 返すポインタは、そのインスタンスが次にトレースするか、スロットが捨てられるまで有効。
-    pub fn render_cached(&mut self, instance: &str, key: &str) -> Result<Option<(*const u8, u32, u32)>> {
+    /// Lua へポインタを返すときは、返す前に `lend` で貸し出しに入れる。スロットが持つ参照は
+    /// そのインスタンスが次にトレースするか、スロットが捨てられると外れる
+    pub fn render_cached(&mut self, instance: &str, key: &str) -> Result<Option<(Raster, u32, u32)>> {
         let valid = match self.slots.get(instance) {
             Some(slot) => {
                 slot.key == key && slot.source.as_ref().is_none_or(SourceStamp::still_valid)
@@ -175,10 +249,23 @@ impl TraceStore {
         slot.used = used;
         if slot.raster.is_none() {
             let (buf, w, h) = rasterize_svg(&slot.svg)?;
-            slot.raster = Some((buf, w, h));
+            slot.raster = Some((Arc::new(buf), w, h));
         }
         let (buf, w, h) = slot.raster.as_ref().expect("filled above");
-        Ok(Some((buf.as_ptr(), *w, *h)))
+        Ok(Some((Arc::clone(buf), *w, *h)))
+    }
+
+    /// Lua へ返す画素を、呼び出したスレッドの貸し出しに入れてポインタを返す。
+    ///
+    /// そのスレッドの前の貸し出しはここで外れる（同じスレッドの Lua は逐次に動くので、
+    /// 前に返したポインタの `obj.putpixeldata` は終わっている）。ほかのスレッドの貸し出しは
+    /// `LEND_GRACE` より古いものだけ片付ける
+    pub fn lend(&mut self, thread: u32, raster: Raster, now: Instant) -> *const u8 {
+        let ptr = raster.as_ptr();
+        self.lent.insert(thread, (raster, now));
+        self.lent
+            .retain(|t, (_, at)| *t == thread || now.saturating_duration_since(*at) < LEND_GRACE);
+        ptr
     }
 
     /// インスタンスの SVG（無ければ直前のトレース結果）
@@ -224,6 +311,7 @@ mod tests {
         ExportTargets {
             export_dir: root.join("SVG_export"),
             handoff_path: root.join("plugin").join("latest_trace.svg"),
+            instance_dir: root.join("plugin").join("traces"),
         }
     }
 
@@ -247,8 +335,8 @@ mod tests {
         }
     }
 
-    fn center_pixel(ptr: *const u8, w: u32, h: u32) -> [u8; 4] {
-        let buf = unsafe { std::slice::from_raw_parts(ptr, (w * h * 4) as usize) };
+    fn center_pixel(buf: &[u8], w: u32, h: u32) -> [u8; 4] {
+        assert_eq!(buf.len(), (w * h * 4) as usize);
         let i = (((h / 2) * w + w / 2) * 4) as usize;
         [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
     }
@@ -329,12 +417,12 @@ mod tests {
         assert!(store.last().unwrap().svg.contains("#0000ff"));
 
         let (p, w, h) = store.render_cached("A", "file|a.png").unwrap().expect("A hit");
-        assert_eq!(center_pixel(p, w, h), [255, 0, 0, 255], "A に B の結果が描かれた");
+        assert_eq!(center_pixel(&p, w, h), [255, 0, 0, 255], "A に B の結果が描かれた");
         let (p, w, h) = store.render_cached("B", "file|b.png").unwrap().expect("B hit");
-        assert_eq!(center_pixel(p, w, h), [0, 0, 255, 255]);
+        assert_eq!(center_pixel(&p, w, h), [0, 0, 255, 255]);
         // 2 回目は描いた画素を使い回しても同じ
         let (p, w, h) = store.render_cached("A", "file|a.png").unwrap().expect("A hit again");
-        assert_eq!(center_pixel(p, w, h), [255, 0, 0, 255]);
+        assert_eq!(center_pixel(&p, w, h), [255, 0, 0, 255]);
 
         // 入力のキーが違えば当てない。知らないインスタンスも当てない
         assert!(store.render_cached("A", "file|b.png").unwrap().is_none());
@@ -367,10 +455,10 @@ mod tests {
         store.store_result(&a, &color("A", "ka"), None, &t).unwrap();
         store.store_result(&b, &color("B", "kb"), None, &t).unwrap();
         let (p, w, h) = store.render_cached("A", "ka").unwrap().unwrap();
-        let px = center_pixel(p, w, h);
+        let px = center_pixel(&p, w, h);
         assert!(px[0] > 180 && px[2] < 80, "A が赤でない: {px:?}");
         let (p, w, h) = store.render_cached("B", "kb").unwrap().unwrap();
-        let px = center_pixel(p, w, h);
+        let px = center_pixel(&p, w, h);
         assert!(px[2] > 180 && px[0] < 80, "B が青でない: {px:?}");
     }
 
@@ -402,5 +490,152 @@ mod tests {
         assert_eq!(store.slot_count(), MAX_SLOTS);
         assert!(store.render_cached("I0", "k").unwrap().is_none());
         assert!(store.render_cached(&format!("I{}", MAX_SLOTS + 4), "k").unwrap().is_some());
+    }
+
+    /// Lua へ貸した画素は、スロットが入れ替わっても捨てられても、同じスレッドが次に
+    /// 受け取るまで解放されない（v0.1.3 はスロットを捨てた時点で解放していた）
+    #[test]
+    fn lent_raster_outlives_slot_replacement() {
+        let t = temp_targets("lend");
+        let mut store = TraceStore::new();
+        let t0 = Instant::now();
+        store
+            .store_result(&rect_svg("#ff0000"), &cfg("A", "k0", false), None, &t)
+            .unwrap();
+        let (raster, w, h) = store.render_cached("A", "k0").unwrap().unwrap();
+        let weak = Arc::downgrade(&raster);
+        let ptr = store.lend(1, raster, t0);
+
+        // 別のオブジェクトの処理に見立てて、A のスロットを入れ替え、さらに追い出す
+        store
+            .store_result(&rect_svg("#0000ff"), &cfg("A", "k1", false), None, &t)
+            .unwrap();
+        for i in 0..(MAX_SLOTS + 2) {
+            store
+                .store_result(&rect_svg("#00ff00"), &cfg(&format!("X{i}"), "k", false), None, &t)
+                .unwrap();
+        }
+        assert!(store.render_cached("A", "k1").unwrap().is_none(), "A は追い出されているはず");
+        assert!(weak.upgrade().is_some(), "貸した画素が解放された");
+        let lent = unsafe { std::slice::from_raw_parts(ptr, (w * h * 4) as usize) };
+        assert_eq!(center_pixel(lent, w, h), [255, 0, 0, 255]);
+
+        // 同じスレッドが次の画素を受け取ったら、前の貸し出しは外れる
+        store
+            .store_result(&rect_svg("#0000ff"), &cfg("A", "k1", false), None, &t)
+            .unwrap();
+        let (next, _, _) = store.render_cached("A", "k1").unwrap().unwrap();
+        store.lend(1, next, t0);
+        assert!(weak.upgrade().is_none(), "前の貸し出しが残り続けている");
+    }
+
+    /// ほかのスレッドの貸し出しは、猶予を過ぎるまで片付けない
+    #[test]
+    fn lend_keeps_other_threads_until_grace() {
+        let mut store = TraceStore::new();
+        let t0 = Instant::now();
+        let a: Raster = Arc::new(vec![1; 4]);
+        let weak_a = Arc::downgrade(&a);
+        store.lend(1, a, t0);
+        store.lend(2, Arc::new(vec![2; 4]), t0 + Duration::from_secs(1));
+        assert!(weak_a.upgrade().is_some(), "猶予の内にほかのスレッドの貸し出しを捨てた");
+        store.lend(2, Arc::new(vec![3; 4]), t0 + LEND_GRACE + Duration::from_secs(1));
+        assert!(weak_a.upgrade().is_none(), "猶予を過ぎた貸し出しが残っている");
+    }
+
+    /// 並列に走らせても、受け取った画素が読む前に別の内容へ変わらない
+    #[test]
+    fn parallel_render_reads_own_pixels() {
+        use std::sync::Mutex;
+        let t = temp_targets("parallel");
+        let store = Arc::new(Mutex::new(TraceStore::new()));
+        let colors = [("#ff0000", [255, 0, 0, 255]), ("#00ff00", [0, 255, 0, 255]), ("#0000ff", [0, 0, 255, 255])];
+        let handles: Vec<_> = colors
+            .iter()
+            .enumerate()
+            .map(|(n, (color, expect))| {
+                let store = Arc::clone(&store);
+                let t = t.clone();
+                let color = color.to_string();
+                let expect = *expect;
+                std::thread::spawn(move || {
+                    let thread = n as u32 + 1;
+                    for i in 0..200 {
+                        let inst = format!("T{n}");
+                        let key = format!("k{i}");
+                        let (ptr, w, h) = {
+                            let mut s = store.lock().unwrap();
+                            s.store_result(&rect_svg(&color), &cfg(&inst, &key, false), None, &t)
+                                .unwrap();
+                            // ほかのスレッドのスロットを追い出す
+                            for j in 0..(MAX_SLOTS / 2) {
+                                s.store_result(
+                                    &rect_svg("#ffffff"),
+                                    &cfg(&format!("F{n}_{j}"), "k", false),
+                                    None,
+                                    &t,
+                                )
+                                .unwrap();
+                            }
+                            let (r, w, h) = s.render_cached(&inst, &key).unwrap().unwrap();
+                            (s.lend(thread, r, Instant::now()), w, h)
+                        };
+                        // Mutex の外で読む（Lua が obj.putpixeldata を呼ぶのと同じ）
+                        std::thread::yield_now();
+                        let px = unsafe { std::slice::from_raw_parts(ptr, (w * h * 4) as usize) };
+                        assert_eq!(center_pixel(px, w, h), expect);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    /// インスタンスごとの受け渡しファイル（aux2 が右クリックしたオブジェクトの ID で引く）
+    #[test]
+    fn instance_handoff_files() {
+        let t = temp_targets("instance");
+        let mut store = TraceStore::new();
+        let out = store
+            .store_result(&rect_svg("#ff0000"), &cfg("12345", "k", false), None, &t)
+            .unwrap();
+        let p = t.instance_dir.join("12345.svg");
+        assert_eq!(out.instance_written.as_deref(), Some(p.as_path()));
+        assert!(std::fs::read_to_string(&p).unwrap().contains("#ff0000"));
+
+        // 同じ内容なら書き直さない。別のインスタンスは別のファイル
+        let out = store
+            .store_result(&rect_svg("#ff0000"), &cfg("12345", "k2", false), None, &t)
+            .unwrap();
+        assert_eq!(out.instance_written, None);
+        store
+            .store_result(&rect_svg("#0000ff"), &cfg("67890", "k", false), None, &t)
+            .unwrap();
+        assert!(std::fs::read_to_string(&p).unwrap().contains("#ff0000"), "別のインスタンスに上書きされた");
+        assert!(std::fs::read_to_string(t.instance_dir.join("67890.svg")).unwrap().contains("#0000ff"));
+
+        // 名前にできないインスタンスは書かない
+        let out = store
+            .store_result(&rect_svg("#00ff00"), &cfg("../evil", "k", false), None, &t)
+            .unwrap();
+        assert_eq!(out.instance_written, None);
+        assert_eq!(files_in(&t.instance_dir), ["12345.svg", "67890.svg"]);
+    }
+
+    #[test]
+    fn instance_file_stem_matches_object_id() {
+        assert_eq!(instance_file_stem("42").as_deref(), Some("42"));
+        assert_eq!(instance_file_stem(" 42 ").as_deref(), Some("42"));
+        // LuaJIT の tostring は 1e15 以上を指数で書く
+        assert_eq!(instance_file_stem("1e+15").as_deref(), Some("1000000000000000"));
+        assert_eq!(instance_file_stem("-7").as_deref(), Some("-7"));
+        assert_eq!(instance_file_stem("1.5"), None);
+        assert_eq!(instance_file_stem("inf"), None);
+        assert_eq!(instance_file_stem(""), None);
+        assert_eq!(instance_file_stem("abc_1").as_deref(), Some("abc_1"));
+        assert_eq!(instance_file_stem("a/b"), None);
+        assert_eq!(instance_file_stem("..\\x"), None);
     }
 }

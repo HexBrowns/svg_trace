@@ -9,22 +9,21 @@ use aviutl2::{
     AnyResult,
 };
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 use store::{ExportTargets, SourceStamp, TraceStore};
 use trace::{rasterize_svg, vectorize_file, vectorize_rgba, write_latest_svg, TraceConfig, TraceResult};
 
 #[aviutl2::plugin(ScriptModule)]
 struct SvgTraceModule {
+    /// トレース結果のスロットと、Lua へ返した画素の貸し出し（`store.rs`）
     store: Mutex<TraceStore>,
-    /// 引数付きの `rasterize_svg(svg)` の描画先（互換用）
-    preview: Mutex<Vec<u8>>,
 }
 
 impl aviutl2::module::ScriptModule for SvgTraceModule {
     fn new(_info: aviutl2::AviUtl2Info) -> AnyResult<Self> {
         Ok(Self {
             store: Mutex::new(TraceStore::new()),
-            preview: Mutex::new(Vec::new()),
         })
     }
 
@@ -49,7 +48,19 @@ fn export_targets() -> ExportTargets {
     ExportTargets {
         export_dir: trace::export_dir(),
         handoff_path: trace::handoff_svg_path(),
+        instance_dir: trace::instance_svg_dir(),
     }
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    safe fn GetCurrentThreadId() -> u32;
+}
+
+/// 貸し出しのキー。Rust の `thread::current()` はホストのスレッドに TLS のデストラクタを
+/// 登録するので使わない（DLL が外れた後に走らせたくない）
+fn current_thread_id() -> u32 {
+    GetCurrentThreadId()
 }
 
 fn config_from_param(params: &ScriptModuleCallHandle, index: usize) -> TraceConfig {
@@ -143,9 +154,12 @@ impl SvgTraceModule {
     fn render_cached(&self, params: &mut ScriptModuleCallHandle) {
         let instance = opt_str(params, 0).unwrap_or_default();
         let key = opt_str(params, 1).unwrap_or_default();
-        let hit = self
-            .lock_store()
-            .and_then(|mut s| s.render_cached(&instance, &key));
+        // 画素はスロットが捨てられても貸し出しが持つ。ポインタを Lua へ返した後に Mutex が外れても、
+        // このスレッドが次に受け取るまでは解放されない（store.rs の「Lua へ返すポインタの寿命」）
+        let hit = self.lock_store().and_then(|mut s| {
+            Ok(s.render_cached(&instance, &key)?
+                .map(|(raster, w, h)| (s.lend(current_thread_id(), raster, Instant::now()), w, h)))
+        });
         match hit {
             Ok(Some((ptr, w, h))) => {
                 let _ = params.push_result((ptr, w as i32, h as i32));
@@ -181,15 +195,15 @@ impl SvgTraceModule {
         }
         match rasterize_svg(&svg) {
             Ok((buf, w, h)) => {
-                let mut preview = match self.preview.lock() {
-                    Ok(p) => p,
+                // render_cached と同じく、このスレッドの貸し出しに持たせる。v0.1.3 までは
+                // 1 つの描画先を全スレッドで使い回していて、並列に走ると返した画素が入れ替わりえた
+                let ptr = match self.lock_store() {
+                    Ok(mut s) => s.lend(current_thread_id(), Arc::new(buf), Instant::now()),
                     Err(e) => {
-                        let _ = params.set_error(&format!("{e}"));
+                        let _ = params.set_error(&format!("{e:#}"));
                         return;
                     }
                 };
-                *preview = buf;
-                let ptr = preview.as_ptr();
                 let _ = params.push_result((ptr, w as i32, h as i32));
             }
             Err(e) => {

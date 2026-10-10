@@ -1099,7 +1099,7 @@ dependencies = [
 
 [[package]]
 name = "svg-trace-aux2"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "aviutl2",
@@ -1107,7 +1107,7 @@ dependencies = [
 
 [[package]]
 name = "svg-trace-mod2"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "aviutl2",
