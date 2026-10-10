@@ -8,6 +8,9 @@ use vtracer::{ColorImage, ColorMode, Config, Hierarchical};
 
 pub const MAX_SIDE: u32 = 2048;
 pub const MAX_COLORS: u32 = 16;
+/// ファイル入力で読む画像の画素数の上限（1 億画素。RGBA で 400 MB）。これより大きい画像は読まずに断る。
+/// どのみち長辺 `MAX_SIDE` に縮めてからトレースするので、先に縮めておけば済む
+pub const MAX_DECODE_PIXELS: u64 = 100_000_000;
 
 #[derive(Debug, Clone)]
 pub struct TraceConfig {
@@ -183,23 +186,6 @@ pub fn latest_svg_path() -> PathBuf {
     export_dir().join("latest.svg")
 }
 
-/// 「SVG_Hへ送る」用の受け渡しファイル。「自動書き出し」が OFF でも、ここだけは
-/// トレースのたびに上書きする（aux2 の `handoff_svg_path` と同じ場所）
-pub fn handoff_svg_path() -> PathBuf {
-    aviutl2::config::app_data_path()
-        .join("Plugin")
-        .join("svg_trace")
-        .join("latest_trace.svg")
-}
-
-/// インスタンスごとの受け渡しファイルの置き場（`{obj.id}.svg`。aux2 の `instance_svg_dir` と同じ場所）
-pub fn instance_svg_dir() -> PathBuf {
-    aviutl2::config::app_data_path()
-        .join("Plugin")
-        .join("svg_trace")
-        .join("traces")
-}
-
 /// Windows 禁則文字などを `_` に置換した安全な stem
 pub fn sanitize_stem(raw: &str) -> String {
     let s: String = raw
@@ -227,7 +213,9 @@ pub fn stem_from_image_path(path: &Path) -> String {
         .unwrap_or_else(|| "image".to_string())
 }
 
-/// ディレクトリ内の `{stem}_NNN.svg` の次の連番（000 始まり）
+/// ディレクトリ内の `{stem}_NNN.svg` の次の連番（000 始まり）。
+///
+/// 番号は 3 桁以上（999 の次は 1000）。v0.1.4 までは 999 で頭打ちになり、以後 `_999` を黙って上書きしていた
 pub fn next_stem_sequence(dir: &Path, stem: &str) -> u32 {
     let prefix = format!("{stem}_");
     let mut max: Option<u32> = None;
@@ -245,54 +233,44 @@ pub fn next_stem_sequence(dir: &Path, stem: &str) -> u32 {
         let Some(num_part) = rest.strip_suffix(".svg") else {
             continue;
         };
-        if num_part.len() == 3 && num_part.chars().all(|c| c.is_ascii_digit()) {
+        if num_part.len() >= 3 && num_part.chars().all(|c| c.is_ascii_digit()) {
             if let Ok(n) = num_part.parse::<u32>() {
                 max = Some(max.map_or(n, |m| m.max(n)));
             }
         }
     }
     match max {
-        Some(n) => n.saturating_add(1).min(999),
+        Some(n) => n.saturating_add(1),
         None => 0,
     }
 }
 
-/// メタから出力ファイル名を決定
-pub fn resolve_export_filename(dir: &Path, meta: &ExportMeta) -> String {
-    if let (Some(layer), Some(frame)) = (meta.layer, meta.frame) {
-        return format!("layer{layer}_{frame}.svg");
-    }
-    if let Some(ref stem) = meta.stem {
-        let safe = sanitize_stem(stem);
-        let n = next_stem_sequence(dir, &safe);
-        return format!("{safe}_{n:03}.svg");
-    }
-    "latest.svg".to_string()
+/// 自動書き出しのファイル名の決め方
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportName {
+    /// レイヤー入力: `layer{n}_{f}.svg`（同じ名前なら上書き）
+    Fixed(String),
+    /// ファイル入力: `{stem}_{連番}.svg`。引数は禁則文字を置き換えた stem
+    Numbered(String),
+    /// どちらでもない: 書き出し先の `latest.svg` だけ
+    LatestOnly,
 }
 
-/// 名前付き SVG を書き、latest.svg も更新
-pub fn write_export_svg(svg: &str, meta: &ExportMeta) -> Result<PathBuf> {
-    write_export_svg_in(&export_dir(), svg, meta)
-}
-
-/// `write_export_svg` の書き出し先を引数で受け取る版（テストはこちらを使う）
-pub fn write_export_svg_in(dir: &Path, svg: &str, meta: &ExportMeta) -> Result<PathBuf> {
-    let dir = dir.to_path_buf();
-    std::fs::create_dir_all(&dir)?;
-    let name = resolve_export_filename(&dir, meta);
-    let path = dir.join(&name);
-    std::fs::write(&path, svg.as_bytes())
-        .with_context(|| format!("Failed to write {}", path.display()))?;
-    if name != "latest.svg" {
-        let latest = dir.join("latest.svg");
-        std::fs::write(&latest, svg.as_bytes())
-            .with_context(|| format!("Failed to write {}", latest.display()))?;
+impl ExportMeta {
+    pub fn export_name(&self) -> ExportName {
+        if let (Some(layer), Some(frame)) = (self.layer, self.frame) {
+            return ExportName::Fixed(format!("layer{layer}_{frame}.svg"));
+        }
+        match &self.stem {
+            Some(stem) => ExportName::Numbered(sanitize_stem(stem)),
+            None => ExportName::LatestOnly,
+        }
     }
-    Ok(path)
 }
 
-pub fn write_latest_svg(svg: &str) -> Result<PathBuf> {
-    write_export_svg(svg, &ExportMeta::default())
+/// 連番のファイル名（3 桁以上）
+pub fn numbered_file_name(stem: &str, n: u32) -> String {
+    format!("{stem}_{n:03}.svg")
 }
 
 // 入力はファイル（`image` の RGBA8）もレイヤー（`obj.getpixeldata`）もストレートアルファ。
@@ -304,17 +282,25 @@ pub fn write_latest_svg(svg: &str) -> Result<PathBuf> {
 /// 透明部分の RGB が縁ににじむので、乗算してから縮小して戻す。
 pub(crate) fn resize_if_needed(mut img: RgbaImage) -> RgbaImage {
     let (w, h) = img.dimensions();
-    let long = w.max(h);
-    if long <= MAX_SIDE {
+    let Some((nw, nh)) = scaled_size(w, h) else {
         return img;
-    }
-    let scale = MAX_SIDE as f32 / long as f32;
-    let nw = ((w as f32) * scale).round().max(1.0) as u32;
-    let nh = ((h as f32) * scale).round().max(1.0) as u32;
+    };
     premultiply_rgba(&mut img);
     let mut out = image::imageops::resize(&img, nw, nh, FilterType::Triangle);
     unpremultiply_rgba(&mut out);
     out
+}
+
+/// 長辺が MAX_SIDE を超えるときの縮めた後の大きさ。超えなければ None
+fn scaled_size(w: u32, h: u32) -> Option<(u32, u32)> {
+    let long = w.max(h);
+    if long <= MAX_SIDE {
+        return None;
+    }
+    let scale = MAX_SIDE as f32 / long as f32;
+    let nw = ((w as f32) * scale).round().max(1.0) as u32;
+    let nh = ((h as f32) * scale).round().max(1.0) as u32;
+    Some((nw, nh))
 }
 
 /// 半透明の画素を色はそのままで不透明にし、完全透明だけ α=0 で残す（vtracer の透明キーは α=0 だけ）。
@@ -434,12 +420,12 @@ fn strip_near_white_fills(svg: &str) -> String {
     out
 }
 
-fn prepare_image(img: RgbaImage, cfg: &TraceConfig) -> RgbaImage {
-    let img = resize_if_needed(img);
+/// 縮めた後の画像を、モードに合わせて vtracer へ渡す形にする
+fn prepare_image(img: &RgbaImage, cfg: &TraceConfig) -> RgbaImage {
     if cfg.mode == 0 {
-        to_binary_bw(&img, cfg.binary_threshold as u8)
+        to_binary_bw(img, cfg.binary_threshold as u8)
     } else {
-        prepare_straight_keep_alpha(&img)
+        prepare_straight_keep_alpha(img)
     }
 }
 
@@ -450,7 +436,29 @@ fn convert_prepared(img: RgbaImage, cfg: &TraceConfig) -> Result<TraceResult> {
     }
     let color_img = rgba_to_color_image(&img);
     let vt_cfg = make_vtracer_config(cfg);
-    let svg_file = vtracer::convert(color_img, vt_cfg).map_err(|e| anyhow!("vtracer: {e}"))?;
+    // vtracer（visioncortex）は、二値で「かたまり」が 65535 個を超えると panic する
+    // （`BinaryImage::to_clusters` の `panic!("overflow")`。写真を FHD のまま二値にすると起きる）。
+    // panic のままだと結果が残らず、毎フレームトレースし直して失敗を繰り返すので、失敗として返す
+    let converted = std::panic::catch_unwind(move || vtracer::convert(color_img, vt_cfg));
+    let svg_file = match converted {
+        Ok(r) => r.map_err(|e| anyhow!("vtracer: {e}"))?,
+        Err(payload) => {
+            let what = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            if what == "overflow" {
+                let hint = if cfg.mode == 0 {
+                    "スペックル除去を上げるか、二値閾値を変えるか、カラーにしてください"
+                } else {
+                    "スペックル除去を上げるか、色数を減らしてください"
+                };
+                bail!("絵が細かすぎてトレースできない（{w}x{h}。かたまりが 65535 個を超えた）。{hint}");
+            }
+            bail!("トレースに失敗した（vtracer: {what}）");
+        }
+    };
     let mut svg = svg_file.to_string();
     if cfg.mode == 0 {
         svg = strip_near_white_fills(&svg);
@@ -460,6 +468,24 @@ fn convert_prepared(img: RgbaImage, cfg: &TraceConfig) -> Result<TraceResult> {
         width: w,
         height: h,
     })
+}
+
+/// 縮めた後の画像（`load_image_file` / `resize_if_needed` を通したもの）をトレースする
+pub fn vectorize_image(img: &RgbaImage, cfg: &TraceConfig) -> Result<TraceResult> {
+    convert_prepared(prepare_image(img, cfg), cfg)
+}
+
+/// レイヤー入力の画素の中身を表すキー（大きさと xxh3 の 128 bit）。
+///
+/// SVG_TRACE.obj2 v0.1.3 まではキャッシュのキーにフレーム番号を入れていたので、下のレイヤーが静止画でも
+/// 毎フレームトレースし直し、同じフレームで下のレイヤーを編集しても描き直さなかった。中身で引けば両方が直る
+pub fn content_key(pixels: &[u8], width: u32, height: u32) -> String {
+    let len = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4)
+        .min(pixels.len());
+    let h = xxhash_rust::xxh3::xxh3_128(&pixels[..len]);
+    format!("{width}x{height}:{h:032x}")
 }
 
 pub fn vectorize_rgba(pixels: &[u8], width: u32, height: u32, cfg: &TraceConfig) -> Result<TraceResult> {
@@ -477,16 +503,48 @@ pub fn vectorize_rgba(pixels: &[u8], width: u32, height: u32, cfg: &TraceConfig)
     }
     let img = RgbaImage::from_raw(width, height, pixels[..expect].to_vec())
         .ok_or_else(|| anyhow!("from_raw failed"))?;
-    let prepared = prepare_image(img, cfg);
-    convert_prepared(prepared, cfg)
+    vectorize_image(&resize_if_needed(img), cfg)
 }
 
+#[allow(dead_code)] // テストと測定から使う。mod2 は読んだ画像をキャッシュする（`lib.rs`）
 pub fn vectorize_file(path: &Path, cfg: &TraceConfig) -> Result<TraceResult> {
-    let img = image::open(path)
-        .with_context(|| format!("open {}", path.display()))?
-        .to_rgba8();
-    let prepared = prepare_image(img, cfg);
-    convert_prepared(prepared, cfg)
+    vectorize_image(&load_image_file(path)?, cfg)
+}
+
+/// 画像ファイルを読み、長辺 `MAX_SIDE` に縮めた RGBA（ストレート）にする。
+///
+/// 先に見出しだけを読んで大きさを確かめ、`MAX_DECODE_PIXELS` を超える画像は展開せずに断る
+/// （v0.1.4 までは 16384² でも全部を展開してから縮めていた）。アルファの無い画像は元の形式のまま縮めてから
+/// RGBA にするので、写真を読むときに元の大きさの RGBA の複製を作らない
+pub fn load_image_file(path: &Path) -> Result<RgbaImage> {
+    let open = || {
+        image::ImageReader::open(path)
+            .with_context(|| format!("画像を開けない: {}", path.display()))?
+            .with_guessed_format()
+            .with_context(|| format!("画像を開けない: {}", path.display()))
+    };
+    let (w, h) = open()?
+        .into_dimensions()
+        .with_context(|| format!("画像の大きさを読めない: {}", path.display()))?;
+    if u64::from(w) * u64::from(h) > MAX_DECODE_PIXELS {
+        bail!(
+            "画像が大きすぎる（{w}x{h}）。{} 万画素までにしてください（長辺 {MAX_SIDE} に縮めてからトレースするので、先に縮めておくと速い）: {}",
+            MAX_DECODE_PIXELS / 10_000,
+            path.display()
+        );
+    }
+    let img = open()?
+        .decode()
+        .with_context(|| format!("画像を読めない: {}", path.display()))?;
+    if img.color().has_alpha() {
+        return Ok(resize_if_needed(img.into_rgba8()));
+    }
+    // アルファが無ければ乗算済みかどうかの区別が要らないので、そのまま縮める
+    let img = match scaled_size(img.width(), img.height()) {
+        Some((nw, nh)) => img.resize_exact(nw, nh, FilterType::Triangle),
+        None => img,
+    };
+    Ok(img.into_rgba8())
 }
 
 pub fn rasterize_svg(svg: &str) -> Result<(Vec<u8>, u32, u32)> {

@@ -8,7 +8,7 @@
 [project]
 id = "HexBrowns.svg_trace"
 name = "SVG_TRACE"
-version = "0.1.4"
+version = "0.2.0"
 
 [artifacts."svg_trace.mod2"]
 build = "cargo build --release -p svg-trace-mod2"

@@ -1,10 +1,10 @@
 #[cfg(test)]
 mod tests {
     use crate::trace::{
-        export_dir_from_project, next_stem_sequence, prepare_straight_keep_alpha, rasterize_svg,
-        resize_if_needed, resolve_export_filename, sanitize_stem, stem_from_image_path,
-        to_binary_bw, unpremultiply_rgba, vectorize_file, vectorize_rgba, ExportMeta, TraceConfig,
-        MAX_SIDE,
+        content_key, export_dir_from_project, load_image_file, next_stem_sequence,
+        numbered_file_name, prepare_straight_keep_alpha, rasterize_svg, resize_if_needed,
+        sanitize_stem, stem_from_image_path, to_binary_bw, unpremultiply_rgba, vectorize_file,
+        vectorize_rgba, ExportMeta, ExportName, TraceConfig, MAX_SIDE,
     };
     use image::{Rgba, RgbaImage};
     use std::path::PathBuf;
@@ -228,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_filename_rules() {
+    fn export_name_rules() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/export_name_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -238,25 +238,115 @@ mod tests {
             layer: Some(3),
             frame: Some(100),
         };
-        assert_eq!(
-            resolve_export_filename(&dir, &layer),
-            "layer3_100.svg"
-        );
+        assert_eq!(layer.export_name(), ExportName::Fixed("layer3_100.svg".into()));
 
         let file = ExportMeta {
-            stem: Some("logo".into()),
+            stem: Some("lo:go".into()),
             layer: None,
             frame: None,
         };
-        assert_eq!(resolve_export_filename(&dir, &file), "logo_000.svg");
+        assert_eq!(file.export_name(), ExportName::Numbered("lo_go".into()));
+        assert_eq!(ExportMeta::default().export_name(), ExportName::LatestOnly);
+
+        assert_eq!(next_stem_sequence(&dir, "logo"), 0);
         std::fs::write(dir.join("logo_000.svg"), b"<svg/>").unwrap();
         assert_eq!(next_stem_sequence(&dir, "logo"), 1);
-        assert_eq!(resolve_export_filename(&dir, &file), "logo_001.svg");
+        // 999 の次は 1000（v0.1.4 までは 999 で止まり、上書きしていた）
+        std::fs::write(dir.join("logo_999.svg"), b"<svg/>").unwrap();
+        assert_eq!(next_stem_sequence(&dir, "logo"), 1000);
+        assert_eq!(numbered_file_name("logo", 1000), "logo_1000.svg");
+        std::fs::write(dir.join("logo_1000.svg"), b"<svg/>").unwrap();
+        assert_eq!(next_stem_sequence(&dir, "logo"), 1001);
+        // 別の画像名や 2 桁は数えない
+        std::fs::write(dir.join("logo2_005.svg"), b"<svg/>").unwrap();
+        std::fs::write(dir.join("logo_99999x.svg"), b"<svg/>").unwrap();
+        assert_eq!(next_stem_sequence(&dir, "logo"), 1001);
+        assert_eq!(numbered_file_name("logo", 7), "logo_007.svg");
+    }
 
-        assert_eq!(
-            resolve_export_filename(&dir, &ExportMeta::default()),
-            "latest.svg"
-        );
+    /// 写真を FHD のまま二値にすると vtracer が panic する（かたまりが 65535 個を超える）。
+    /// panic ではなく、理由の分かる失敗として返す
+    #[test]
+    fn binary_overflow_is_an_error_not_a_panic() {
+        let (w, h) = (1920u32, 1080u32);
+        let mut img = RgbaImage::new(w, h);
+        // 市松模様（1 画素ごと）で、かたまりが画素数の半分になる
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            let v = if (x + y) % 2 == 0 { 0 } else { 255 };
+            *p = Rgba([v, v, v, 255]);
+        }
+        let cfg = TraceConfig {
+            mode: 0,
+            filter_speckle: 0,
+            ..TraceConfig::default()
+        };
+        let err = vectorize_rgba(img.as_raw(), w, h, &cfg).expect_err("失敗するはず");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("65535"), "理由が分からない: {msg}");
+    }
+
+    #[test]
+    fn content_key_follows_pixels() {
+        let a = vec![1u8; 16];
+        let mut b = a.clone();
+        assert_eq!(content_key(&a, 2, 2), content_key(&b, 2, 2));
+        b[5] = 2;
+        assert_ne!(content_key(&a, 2, 2), content_key(&b, 2, 2));
+        // 同じ画素列でも大きさが違えば別
+        assert_ne!(content_key(&a, 2, 2), content_key(&a, 4, 1));
+    }
+
+    /// 大きすぎる画像は展開せずに断る（見出しだけ読む）
+    #[test]
+    fn huge_image_is_refused_before_decoding() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("huge_header.png");
+        // 20000x20000 の PNG の見出し（IHDR）だけを書く。展開しようとすれば中身が無くて失敗する
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(b"IHDR");
+        ihdr.extend_from_slice(&20000u32.to_be_bytes());
+        ihdr.extend_from_slice(&20000u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(&ihdr);
+        png.extend_from_slice(&crc32(&ihdr).to_be_bytes());
+        // 見出しの読み取りは最初の IDAT まで進むので、空の IDAT と IEND を足す
+        for name in [b"IDAT", b"IEND"] {
+            png.extend_from_slice(&0u32.to_be_bytes());
+            png.extend_from_slice(name);
+            png.extend_from_slice(&crc32(name).to_be_bytes());
+        }
+        std::fs::write(&path, &png).unwrap();
+        let err = load_image_file(&path).expect_err("断るはず");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("大きすぎる") && msg.contains("20000x20000"), "{msg}");
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in data {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            }
+        }
+        !crc
+    }
+
+    /// アルファの無い大きな画像は元の形式のまま縮めて読む（縮めた後の大きさと色）
+    #[test]
+    fn opaque_large_image_is_resized_on_load() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("opaque_large.png");
+        image::RgbImage::from_pixel(MAX_SIDE * 2, 100, image::Rgb([10, 200, 30]))
+            .save(&path)
+            .unwrap();
+        let img = load_image_file(&path).unwrap();
+        assert_eq!(img.dimensions(), (MAX_SIDE, 50));
+        assert_eq!(img.get_pixel(10, 10).0, [10, 200, 30, 255]);
     }
 
     #[test]

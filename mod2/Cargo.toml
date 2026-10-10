@@ -19,3 +19,5 @@ color_quant = "1.1"
 resvg = "0.47.0"
 vtracer = "0.6.5"
 visioncortex = "0.8"
+# レイヤー入力の画素の中身でキャッシュを引く（`trace::content_key`）
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
